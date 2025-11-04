@@ -1,0 +1,22 @@
+# Jupyter checkpoint junk (keep your .ipynb files!)
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+**/.venv/
+venv/
+env/
+
+# Python build/cache noise (handy)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist/
+.build/
+
+# OS/editor cruft (optional but nice)
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

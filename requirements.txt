@@ -1,0 +1,21 @@
+# requirements.txt (CUDA 13.0 build for PyTorch)
+# Installs GPU-enabled torch/torchvision matching your NVIDIA driver (CUDA 13.0).
+# If install fails, change 'cu130' below to 'cu128' or 'cu126' and retry.
+
+--index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://pypi.org/simple
+
+# Core
+torch
+torchvision
+numpy
+tqdm
+matplotlib
+pillow
+cython
+tensorboard
+
+# Notes:
+# - Keep the two index lines at the top so pip pulls CUDA wheels for torch/torchvision
+# - Other packages come from PyPI via the extra index
+# - You didn't import torchaudio, so it's omitted.
