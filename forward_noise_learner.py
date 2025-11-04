@@ -4,278 +4,401 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader, random_split
+import os, csv, math, argparse, random
+from typing import Tuple
+from torchvision.models import resnet18
+import torch.nn as nn
 
-# -----------------------
-# Utils
-# -----------------------
-def set_seed(seed: int):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+# -------------------------
+#  Utils: seed & split
+# -------------------------
+def set_seed(seed: int = 20251013):
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-@torch.no_grad()
-def row_normalize(T: torch.Tensor, eps=1e-8):
-    T = T.clamp_min(eps)
-    return T / T.sum(dim=1, keepdim=True)  # 行和=1: P(ŷ=j|Y=i)
+def stratified_split(y, val_ratio=0.2, seed=20251013):
+    """stratified split on noisy labels y (1D numpy array)"""
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y)
+    idx = np.arange(len(y))
+    tr_idx, val_idx = [], []
+    for c in np.unique(y):
+        c_idx = idx[y == c]
+        rng.shuffle(c_idx)
+        n_val = int(round(len(c_idx) * val_ratio))
+        val_idx.append(c_idx[:n_val])
+        tr_idx.append(c_idx[n_val:])
+    return np.concatenate(tr_idx), np.concatenate(val_idx)
 
-def to_tensor_images(x):
+# -------------------------
+#  Data helpers
+# -------------------------
+def infer_image_shape(x2d: np.ndarray) -> Tuple[int,int,int]:
+    """Infer C,H,W from flattened vectors."""
+    D = x2d.shape[1]
+    if D == 28*28: return (1, 28, 28)
+    if D == 32*32*3: return (3, 32, 32)
+    # try square-ish gray
+    s = int(round(math.sqrt(D)))
+    if s*s == D: return (1, s, s)
+    # fallback: 1xHxW where W=D
+    return (1, 1, D)
+
+def to_tensor_images(x: np.ndarray) -> torch.Tensor:
     x = x.astype(np.float32)
-    if x.max() > 1.0:
-        x = x / 255.0
-
-    # 扁平 [N, D] -> 还原为图片
-    if x.ndim == 2:
-        N, D = x.shape
-        if D == 28*28:            # FashionMNIST
-            x = x.reshape(N, 1, 28, 28)
-            return torch.from_numpy(x)
-        elif D == 32*32*3:        # CIFAR 扁平
-            x = x.reshape(N, 3, 32, 32)
-            return torch.from_numpy(x)
-        elif D == 32*32:          # 以防灰度 32x32
-            x = x.reshape(N, 1, 32, 32)
-            return torch.from_numpy(x)
-        else:
-            raise ValueError(f"Unknown flattened image size D={D}")
-
-    # 非扁平情况
-    if x.ndim == 3:               # [N,H,W] 灰度
-        x = x[:, None, :, :]
-    elif x.ndim == 4:             # [N,H,W,C] 彩色
-        x = np.transpose(x, (0, 3, 1, 2))
-    else:
-        raise ValueError(f"Unexpected image shape: {x.shape}")
+    # scale to [0,1] if looks like 0-255
+    if x.max() > 1.5: x = x/255.0
+    if x.ndim == 2:   # flattened
+        C,H,W = infer_image_shape(x)
+        x = x.reshape((-1, C, H, W))
+    elif x.ndim == 3: # (N,H,W) -> (N,1,H,W)
+        x = x[:, None, ...]
+    elif x.ndim == 4: # (N,H,W,C) -> (N,C,H,W)
+        if x.shape[-1] in (1,3):
+            x = np.transpose(x, (0,3,1,2))
     return torch.from_numpy(x)
 
-def guess_keys(keys):
-    keys = list(keys)
+class NumpyTensorDataset(torch.utils.data.Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = to_tensor_images(X)
+        self.y = torch.from_numpy(y.astype(np.int64))
+    def __len__(self): return self.X.size(0)
+    def __getitem__(self, i): return self.X[i], self.y[i]
 
-    def find_any(cands):
-        # 先精确再包含（用于 Xte/Xts、Yte/Yts 等）
-        for name in cands:
-            for k in keys:
-                if k.lower() == name.lower():
-                    return k
-        for name in cands:
-            for k in keys:
-                if name.lower() in k.lower():
-                    return k
-        return None
-
-    def find_exact(cands):
-        for name in cands:
-            for k in keys:
-                if k.lower() == name.lower():
-                    return k
-        return None
-
-    kXtr = find_any(["Xtr","x_train","trainX","images_tr"])
-    kStr = find_any(["Str","y_train","trainY","labels_tr"])
-    kXte = find_any(["Xte","Xts","x_test","testX","images_te","images_ts","xts"])
-    kYte = find_any(["Yte","Yts","Ste","y_test","testY","labels_te","labels_ts","yts"])
-    kT   = find_exact(["T","transition","noise_T","trans"])  # 只精确匹配！
-
-    print(f"[guess_keys] -> Xtr={kXtr}, Str={kStr}, Xte={kXte}, Yte={kYte}, T={kT}")
-    return kXtr, kStr, kXte, kYte, kT
-
-def load_npz_dataset(path):
-    data = np.load(path, allow_pickle=True)
-    keys = list(data.keys())
-    kXtr, kStr, kXte, kYte, kT = guess_keys(keys)
-    assert kXtr and kStr and kXte and kYte, f"NPZ keys not found. Found: {keys}"
-
-    Xtr = to_tensor_images(data[kXtr])
-    Str = torch.from_numpy(data[kStr].astype(np.int64))
-    Xte = to_tensor_images(data[kXte])
-    Yte = torch.from_numpy(data[kYte].astype(np.int64))
-
-    T = None
-    if kT is not None:
-        T_np = data[kT].astype(np.float32)
-        T = torch.from_numpy(T_np)
-
-    num_classes = int(max(Str.max().item(), Yte.max().item()) + 1)
-    return Xtr, Str, Xte, Yte, T, num_classes
-
-# -----------------------
-# Small CNN backbone
-# -----------------------
+# -------------------------
+#  Models
+# -------------------------
 class SmallCNN(nn.Module):
-    def __init__(self, in_ch=1, num_classes=3):
+    def __init__(self, in_ch=1, num_classes=10):
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(in_ch, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 3, padding=1), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1),    nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1),   nn.ReLU(True),
+            nn.AdaptiveAvgPool2d(1)
         )
         self.fc = nn.Linear(128, num_classes)
-
     def forward(self, x):
-        x = self.features(x)
-        x = x.flatten(1)
+        x = self.net(x).flatten(1)
         return self.fc(x)
+    
+def make_resnet18_cifar(in_ch: int, num_classes: int):
+    m = resnet18(weights=None)
+    m.conv1  = nn.Conv2d(in_ch, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    m.maxpool = nn.Identity()
+    m.fc = nn.Linear(512, num_classes)
+    return m
 
-# -----------------------
-# Losses
-# -----------------------
-def forward_ce_loss(logits, y_noisy, T_row_stoch):
-    p = F.softmax(logits, dim=1)            # [B,C]
-    p_tilde = torch.matmul(p, T_row_stoch)  # [B,C]
-    log_p_tilde = torch.log(p_tilde.clamp_min(1e-12))
-    return F.nll_loss(log_p_tilde, y_noisy)
+# -------------------------
+#  Losses (Forward correction)
+# -------------------------
+def row_normalize(T: torch.Tensor) -> torch.Tensor:
+    return T / (T.sum(dim=1, keepdim=True) + 1e-12)
 
-def gce_loss(logits, y_noisy, q=0.7, eps=1e-12):
-    p = F.softmax(logits, dim=1)
-    p_y = p.gather(1, y_noisy.view(-1,1)).squeeze(1).clamp_min(eps)
-    return ((1 - p_y.pow(q)) / q).mean()
-
-# -----------------------
-# Anchor-based T estimation
-# -----------------------
+def forward_ce_loss(logits, y_noisy, T):
+    probs = torch.softmax(logits, dim=1)   # [N,K]
+    noisy_probs = probs @ T                # T: clean->noisy
+    log_noisy = torch.log(noisy_probs + 1e-12)
+    return F.nll_loss(log_noisy, y_noisy)
+# -------------------------
+#  Anchor-based T estimation
+# -------------------------
 @torch.no_grad()
-def estimate_T_anchor(model, loader, num_classes, device, topk=0.02):
+def estimate_T_anchor(model, loader, num_classes, device, topk=0.02, min_prob=0.0):
+    """Use validation set (noisy labels) to estimate T_hat.
+       For each predicted clean class i, take high-confidence samples, tally observed noisy labels."""
     model.eval()
-    preds, probs, noisy = [], [], []
-    for xb, yb in loader:
-        xb = xb.to(device)
-        logits = model(xb)
-        p = F.softmax(logits, dim=1)
-        pr, pd = p.max(dim=1)
-        preds.append(pd.cpu()); probs.append(pr.cpu()); noisy.append(yb)
-    preds = torch.cat(preds); probs = torch.cat(probs); noisy = torch.cat(noisy)
-
-    T = torch.zeros(num_classes, num_classes, dtype=torch.float64)
+    probs_all, pred_all, noisy_all = [], [], []
+    for x, s in loader:
+        x = x.to(device)
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1).cpu()
+        probs_all.append(probs)
+        pred_all.append(probs.argmax(1))
+        noisy_all.append(s)
+    probs = torch.cat(probs_all)     # [N,K]
+    preds = torch.cat(pred_all)      # [N]
+    noisy = torch.cat(noisy_all)     # [N]
+    T = torch.zeros((num_classes, num_classes), dtype=torch.float64)
+    N = probs.size(0)
     for i in range(num_classes):
         idx = (preds == i).nonzero(as_tuple=False).squeeze(1)
         if idx.numel() == 0:
             T[i] = torch.full((num_classes,), 1.0/num_classes, dtype=torch.float64)
             continue
-        k = max(1, int(math.ceil(idx.numel() * topk)))
-        top = idx[probs[idx].argsort(descending=True)[:k]]
-        hist = torch.bincount(noisy[top], minlength=num_classes).double()
+       
+        if min_prob > 0.0:
+            keep = idx[probs[idx, i] >= min_prob]
+        else:
+            keep = torch.empty(0, dtype=torch.long)
+        use = keep
+        if use.numel() == 0:
+            k = max(1, int(math.ceil(idx.numel()*topk)))
+            order = probs[idx, i].argsort(descending=True)
+            use = idx[order[:k]]
+        hist = torch.bincount(noisy[use], minlength=num_classes).double()
         T[i] = hist / hist.sum().clamp_min(1.0)
-    return row_normalize(T.float())
+    return T.float()
 
-# -----------------------
-# Train / evaluate
-# -----------------------
-def accuracy(model, loader, device):
+# -------------------------
+#  Metrics: Acc, Macro-F1, NLL, ECE
+# -------------------------
+def macro_f1_from_preds(y_true: np.ndarray, y_pred: np.ndarray, K: int) -> float:
+    cm = np.zeros((K, K), dtype=np.int64)
+    for t, p in zip(y_true, y_pred): cm[t, p] += 1
+    f1s = []
+    for k in range(K):
+        tp = cm[k,k]; fp = cm[:,k].sum()-tp; fn = cm[k,:].sum()-tp
+        prec = tp / (tp+fp+1e-12); reca = tp / (tp+fn+1e-12)
+        f1s.append(2*prec*reca/(prec+reca+1e-12))
+    return float(np.mean(f1s))
+
+def ece_score(probs: np.ndarray, y_true: np.ndarray, n_bins: int = 15) -> float:
+    conf = probs.max(1)
+    pred = probs.argmax(1)
+    bins = np.linspace(0.,1.,n_bins+1)
+    ece = 0.0; N = len(y_true)
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i+1]
+        m = (conf > lo) & (conf <= hi)
+        if not np.any(m): continue
+        acc_b = (pred[m] == y_true[m]).mean()
+        conf_b = conf[m].mean()
+        ece += (m.mean())*abs(acc_b - conf_b)
+    return float(ece)
+
+@torch.no_grad()
+def evaluate(model, loader, num_classes, device):
     model.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            out = model(xb)
-            pred = out.argmax(1)
-            correct += (pred == yb).sum().item()
-            total += yb.numel()
-    return correct / total
+    tot, correct, nll_sum = 0, 0, 0.0
+    probs_all, y_all, p_all = [], [], []
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1)
+        nll_sum += F.nll_loss(torch.log(probs+1e-12), y, reduction='sum').item()
+        pred = probs.argmax(1)
+        correct += (pred==y).sum().item()
+        tot += y.size(0)
+        probs_all.append(probs.cpu()); y_all.append(y.cpu()); p_all.append(pred.cpu())
+    probs = torch.cat(probs_all).numpy()
+    y_true = torch.cat(y_all).numpy()
+    y_pred = torch.cat(p_all).numpy()
+    acc = correct / tot
+    nll = nll_sum / tot
+    macro_f1 = macro_f1_from_preds(y_true, y_pred, num_classes)
+    ece = ece_score(probs, y_true, n_bins=15)
+    return dict(acc=float(acc), macro_f1=float(macro_f1), nll=float(nll), ece=float(ece))
 
-def train_one(dataset_name, Xtr, Str, Xte, Yte, T_given, num_classes,
+# -------------------------
+#  Train loop (warm-up -> estimate T -> forward training)
+# -------------------------
+def train_one(dataset_name, Xtr, Str, Xval, Sval, Xte, Yte, T_given, C,
               epochs=50, batch_size=128, lr=1e-3, weight_decay=1e-4,
-              estimate_T=False, warmup_epochs=8, topk=0.02, seed=0, device='cpu'):
+              warmup_epochs=8, topk=0.02, min_prob=0.0, mixT=0.0,
+              seed=20251013, device='cpu', arch='cnn'):   
+
     set_seed(seed)
+    num_classes = int(C)
 
-    n = len(Xtr)
-    n_val = int(0.2 * n)
-    n_tr  = n - n_val
-    ds_all = TensorDataset(Xtr, Str)
-    tr_set, val_set = random_split(ds_all, [n_tr, n_val], generator=torch.Generator().manual_seed(seed))
-    te_set = TensorDataset(Xte, Yte)
+    train_ds = NumpyTensorDataset(Xtr, Str)
+    val_ds   = NumpyTensorDataset(Xval, Sval)
+    test_ds  = NumpyTensorDataset(Xte, Yte)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = torch.utils.data.DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    test_loader  = torch.utils.data.DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
 
-    # Windows 建议 num_workers=0
-    tr_loader  = DataLoader(tr_set, batch_size=batch_size, shuffle=True,  num_workers=0)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0)
-    te_loader  = DataLoader(te_set,  batch_size=batch_size, shuffle=False, num_workers=0)
+    in_ch = train_ds.X.shape[1]
+    use_resnet = (arch == 'resnet18') or (arch == 'auto' and in_ch == 3)
 
-    in_ch = Xtr.shape[1]
-    model = SmallCNN(in_ch=in_ch, num_classes=num_classes).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    best_val, best_state = -1.0, None
 
-    # 先决定 T 的来源
+    print("[DEBUG] use_resnet =", use_resnet, "| arch passed =", arch)
+
+    if use_resnet:
+        m = resnet18(weights=None)            # 旧版可写 pretrained=False
+        m.conv1  = nn.Conv2d(in_ch, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        m.maxpool = nn.Identity()             # CIFAR32 不需要 7x7+stride2 的池化
+        m.fc = nn.Linear(512, num_classes)
+
+        model = m.to(device)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    else:
+        model = SmallCNN(in_ch=in_ch, num_classes=num_classes).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = None
+
+
+
+
     T_used = None
-    if T_given is not None and not estimate_T:
-        T_used = row_normalize(T_given.to(device))
+    if (T_given is not None) and (warmup_epochs == 0):
+        T_used = row_normalize(T_given.clone().to(device))
 
-    # 未知 T：warmup -> 估计 T̂
-    if (T_used is None) and estimate_T:
-        for _ in range(warmup_epochs):
-            model.train()
-            for xb, yb in tr_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                loss = F.cross_entropy(model(xb), yb)
-                opt.zero_grad(); loss.backward(); opt.step()
-        T_hat = estimate_T_anchor(model, val_loader, num_classes, device=device, topk=topk)
-        T_used = T_hat.to(device)
-
-    # 正式训练（Forward 或 CE）
-    for _ in range(epochs):
+    for ep in range(epochs):
         model.train()
-        for xb, yb in tr_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            logits = model(xb)
-            loss = forward_ce_loss(logits, yb, T_used) if T_used is not None else F.cross_entropy(logits, yb)
+        for x, y_noisy in train_loader:
+            x, y_noisy = x.to(device), y_noisy.to(device)
+            logits = model(x)
+            if (T_used is None) or (ep < warmup_epochs):
+                loss = F.cross_entropy(logits, y_noisy)         # warm-up
+            else:
+                loss = forward_ce_loss(logits, y_noisy, T_used) # forward correction
             opt.zero_grad(); loss.backward(); opt.step()
 
-        val_acc = accuracy(model, val_loader, device)
-        if val_acc > best_val:
-            best_val = val_acc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        # Switch to Forward: After the warmup ends, the first time
+        if (ep+1) == warmup_epochs:
+            if T_given is not None:
+                T_used = row_normalize(T_given.clone().to(device))
+            else:
+                T_hat = estimate_T_anchor(model, val_loader, num_classes, device, topk=topk, min_prob=min_prob)
+                T_hat = row_normalize(T_hat.to(device))
+                if mixT > 0.0:
+                    I = torch.eye(num_classes, device=device)
+                    T_hat = row_normalize((1.0 - mixT)*T_hat + mixT*I)
+                T_used = T_hat
+        if scheduler is not None:
+            scheduler.step()
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    test_acc = accuracy(model, te_loader, device)
-    return test_acc, (T_used.detach().cpu().numpy() if T_used is not None else None)
+    # Evaluation (clean test labels)
+    metrics = evaluate(model, test_loader, num_classes, device)
+    return metrics, (T_used.detach().cpu().numpy() if T_used is not None else None)
 
-# -----------------------
-# Main
-# -----------------------
+# -------------------------
+#  NPZ loader & key guessing
+# -------------------------
+def load_npz_dataset(path: str):
+    d = np.load(path, allow_pickle=True)
+    keys_all = list(d.keys())
+
+    def pick(*cands):
+        for k in cands:
+            if k in d: 
+                return k
+        raise KeyError(f"Missing any of {cands} in file. Found keys={keys_all}")
+
+    k_Xtr = pick('Xtr','X_train','Xtrain','X_tr')
+    k_Str = pick('Str','ytr','S','y_train','Ytr','Y_tr')
+    k_Xte = pick('Xte','Xts','X_test','Xtest','X_te','X_ts')
+    k_Yte = pick('Yte','Yts','yte','Y_test','Ytest','Y_te','Y_ts')
+    k_T   = 'T' if 'T' in d else None
+
+    Xtr, Str = d[k_Xtr], d[k_Str]
+    Xte, Yte = d[k_Xte], d[k_Yte]
+    T = d[k_T].astype(np.float32) if k_T else None
+    C = int(max(Str.max(), Yte.max()) + 1)
+
+    print(f"[keys] {keys_all}")
+    print(f"[mapping] Xtr={k_Xtr}, Str={k_Str}, Xte={k_Xte}, Yte={k_Yte}, T={'T' if k_T else 'None'}")
+    return Xtr, Str, Xte, Yte, T, C
+
+# -------------------------
+#  Main
+# -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, required=True)
+    parser.add_argument('--arch', choices=['auto','cnn','resnet18'], default='auto')
+    parser.add_argument('--data', type=str, required=True, help='path to .npz')
     parser.add_argument('--runs', type=int, default=10)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
-    parser.add_argument('--estimate-T', action='store_true')
+    parser.add_argument('--device', type=str, default='cpu')
+    parser.add_argument('--seed', type=int, default=20251013)
+    parser.add_argument('--val-ratio', type=float, default=0.2)
     parser.add_argument('--warmup-epochs', type=int, default=8)
-    parser.add_argument('--topk', type=float, default=0.02)
-    parser.add_argument('--device', type=str, default='cpu')  # 想用GPU就传 --device cuda
+    parser.add_argument('--topk', type=float, default=0.02, help='anchor top-k ratio if no min-prob')
+    parser.add_argument('--min-prob', type=float, default=0.0, help='confidence threshold for anchors')
+    parser.add_argument('--mixT', type=float, default=0.0, help='blend T_hat with identity: T <- (1-a)T + aI')
     args = parser.parse_args()
 
-    assert os.path.exists(args.data), f"not found: {args.data}"
     Xtr, Str, Xte, Yte, T, C = load_npz_dataset(args.data)
-
     dataset_name = os.path.splitext(os.path.basename(args.data))[0]
+
+    device = torch.device(args.device)
+
     os.makedirs('results', exist_ok=True)
     out_csv = os.path.join('results', f'{dataset_name}_forward_runs.csv')
     out_Tnpz = os.path.join('results', f'{dataset_name}_T_used_runs.npz')
 
-    all_acc, T_list = [], []
-    for r in range(args.runs):
-        seed = 2025_10_13 + r
-        acc, T_used = train_one(
-            dataset_name, Xtr, Str, Xte, Yte, T, C,
-            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
-            estimate_T=args.estimate_T or (T is None),
-            warmup_epochs=args.warmup_epochs, topk=args.topk, seed=seed, device=args.device
-        )
-        all_acc.append(acc); T_list.append(T_used)
-        print(f'Run {r+1}/{args.runs}: test acc = {acc:.4f}')
-
-    mean = float(np.mean(all_acc)); std = float(np.std(all_acc))
-    print(f'==> {dataset_name}: mean±std test acc = {mean:.4f} ± {std:.4f}')
-
+    # CSV header
     with open(out_csv, 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['run', 'test_acc'])
-        for i, a in enumerate(all_acc, 1): w.writerow([i, a])
-        w.writerow(['mean', mean]); w.writerow(['std', std])
+        csv.writer(f).writerow(['run', 'acc', 'macro_f1', 'nll', 'ece'])
 
-    np.savez(out_Tnpz, **{f'T_run{i+1}': T for i, T in enumerate(T_list) if T is not None})
+    all_metrics = []
+    T_collection = {}
+
+    for r in range(args.runs):
+        seed = args.seed + r
+        # stratified split on noisy labels (consistent mechanism across train/val)
+        tr_idx, val_idx = stratified_split(Str, val_ratio=args.val_ratio, seed=seed)
+        X_tr, S_tr = Xtr[tr_idx], Str[tr_idx]
+        X_val, S_val = Xtr[val_idx], Str[val_idx]
+
+        metrics, T_used = train_one(
+            dataset_name, X_tr, S_tr, X_val, S_val, Xte, Yte,
+            None if T is None else torch.from_numpy(T),
+            C=C,
+            epochs=args.epochs, batch_size=args.batch_size,
+            lr=args.lr, weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs, topk=args.topk,
+            min_prob=args.min_prob, mixT=args.mixT,
+            seed=seed, device=device,
+            arch=args.arch              
+        )
+
+        all_metrics.append(metrics)
+        with open(out_csv, 'a', newline='') as f:
+            csv.writer(f).writerow([r+1, metrics['acc'], metrics['macro_f1'], metrics['nll'], metrics['ece']])
+        print(f"Run {r+1}/{args.runs}: acc={metrics['acc']:.4f}, macroF1={metrics['macro_f1']:.4f}, "
+              f"NLL={metrics['nll']:.4f}, ECE={metrics['ece']:.4f}")
+
+        if T_used is not None:
+            T_collection[f'T_run{r+1}'] = T_used
+
+    # aggregate
+    accs  = np.array([m['acc'] for m in all_metrics], dtype=np.float64)
+    f1s   = np.array([m['macro_f1'] for m in all_metrics], dtype=np.float64)
+    nlls  = np.array([m['nll'] for m in all_metrics], dtype=np.float64)
+    eces  = np.array([m['ece'] for m in all_metrics], dtype=np.float64)
+
+    mean_acc, std_acc = accs.mean(), accs.std()
+    mean_f1,  std_f1  = f1s.mean(),  f1s.std()
+    mean_nll, std_nll = nlls.mean(), nlls.std()
+    mean_ece, std_ece = eces.mean(), eces.std()
+
+    print(f"==> {dataset_name}: mean±std acc = {mean_acc:.4f} ± {std_acc:.4f}")
+    with open(out_csv, 'a', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['mean', mean_acc, mean_f1, mean_nll, mean_ece])
+        w.writerow(['std',  std_acc,  std_f1,  std_nll,  std_ece])
+
+    if len(T_collection):
+        np.savez(out_Tnpz, **T_collection)
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
