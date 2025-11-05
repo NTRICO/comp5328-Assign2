@@ -152,16 +152,48 @@ def estimate_T_confident(model, loader, device, top_k=200, num_classes=3):
     return T
 
 # -------------------- Train / Eval --------------------
-def train_epochs(model, criterion, opt, train_loader, val_loader, device, epochs=15):
+def train_epochs(model, criterion, opt, train_loader, val_loader, device, epochs=20, patience=5):
     model.to(device)
-    for _ in range(epochs):
+    best_state = None
+    best_val = -1.0
+    bad_epochs = 0
+
+    for ep in range(epochs):
         model.train()
         for xb, yb in train_loader:
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
             opt.zero_grad()
             loss = criterion(model(xb), yb)
             loss.backward()
+            # (optional) torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+
+        # --- validate & track best ---
+        val_acc = 0.0
+        if val_loader is not None:
+            model.eval()
+            correct = total = 0
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    pred = model(xb).argmax(1)
+                    correct += (pred == yb).sum().item()
+                    total += yb.numel()
+            val_acc = correct / max(total, 1)
+
+            if val_acc > best_val:
+                best_val = val_acc
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    break  # early stop
+
+    # restore best weights before returning
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
 
 @torch.no_grad()
 def top1_acc(model, loader, device):
